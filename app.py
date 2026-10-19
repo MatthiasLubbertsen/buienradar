@@ -1,106 +1,95 @@
-"""Tiny server that serves Buienradar rain graphs as PNG.
+"""Serves screenshots of the rain graph on buienradar.nl as PNG.
 
     python app.py [port]      ->  http://localhost:8000/putten.png
                                   http://localhost:8000/barneveld.png
+                                  add ?theme=light for the light variant
+
+The graph is the real `.area-graph` element of the Buienradar weather page,
+captured with headless Chromium (Playwright).
+
+Debug: BR_MOCK_RAIN=1 injects fake rain into the graph request so the
+rendering can be checked on a dry day.
 """
-import io
-import json
+import os
 import sys
+import threading
 import time
-import urllib.request
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
-from PIL import Image, ImageDraw, ImageFont
+from playwright.sync_api import sync_playwright
 
+# slug and Buienradar location id (https://location.buienradar.nl/1.1/location/search?query=...)
 PLACES = {
-    "putten": (52.2575, 5.6),
-    "barneveld": (52.1403, 5.5875),
+    "putten": 2748392,
+    "barneveld": 2759407,
 }
-API = "https://graphdata.buienradar.nl/2.0/forecast/geo/RainHistoryForecast?lat={}&lon={}"
+PAGE = "https://www.buienradar.nl/weer/{}/nl/{}"
 CACHE_SECONDS = 120
+CHROMIUM_PATH = os.environ.get("CHROMIUM_PATH") or None  # None = Playwright's own browser
+MOCK_RAIN = os.environ.get("BR_MOCK_RAIN") == "1"
 
-W, H, S = 720, 300, 2  # output size, supersampling factor
-BG, GRID, FG, BAR, BASE = "#1c1c1c", "#4a4a4a", "#f2f2f2", "#ffffff", "#2f5f8a"
-FONT_PATHS = [
-    "/usr/share/fonts/opentype/inter/Inter-Regular.otf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    "DejaVuSans.ttf",
-    "Arial.ttf",
-]
-LEVELS = [(40, "Licht"), (70, "Matig"), (100, "Zwaar")]  # evenly spaced, like buienradar.nl
+# Hide the consent wall and the hover pointer + "12:45 / 0 mm/u" tooltip that covers the graph.
+HIDE_CSS = ".payok__wrap, #onetrust-consent-sdk, .preciptation-line { display: none !important; }"
 
 _cache = {}
+_lock = threading.Lock()  # one browser at a time; renders are cached anyway
 
 
-def font(size):
-    for p in FONT_PATHS:
+def mock_rain(route):
+    """Replace the forecast with a fake rain shower (debug only)."""
+    import json
+
+    resp = route.fetch()
+    data = resp.json()
+    pts = data["forecasts"]
+    shape = [0, 5, 15, 30, 45, 60, 75, 85, 70, 50, 30, 15, 5, 0]
+    for i, pct in enumerate(shape):
+        j = len(pts) // 2 + i
+        if j < len(pts):
+            pts[j]["percentageValue"] = float(pct)
+            pts[j]["dataValue"] = round(pct / 25, 2)
+    route.fulfill(response=resp, body=json.dumps(data))
+
+
+def capture(place, theme):
+    url = PAGE.format(place, PLACES[place])
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            executable_path=CHROMIUM_PATH, args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
         try:
-            return ImageFont.truetype(p, size * S)
-        except OSError:
-            pass
-    return ImageFont.load_default(size * S)
+            page = browser.new_page(
+                viewport={"width": 1280, "height": 1000},
+                device_scale_factor=2,
+                locale="nl-NL",
+                timezone_id="Europe/Amsterdam",
+                color_scheme=theme,
+            )
+            if MOCK_RAIN:
+                page.route("**/RainHistoryForecast*", mock_rain)
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.add_style_tag(content=HIDE_CSS)
+            graph = page.locator(".area-graph").first
+            graph.wait_for(timeout=30000)
+            # wait until the SVG has been drawn, then let the fade-in animation settle
+            page.wait_for_selector(".area-graph svg path", state="attached", timeout=30000)
+            graph.scroll_into_view_if_needed()
+            page.wait_for_timeout(1500)
+            return graph.screenshot(type="png")
+        finally:
+            browser.close()
 
 
-def fetch(place):
-    hit = _cache.get(place)
-    if hit and time.time() - hit[0] < CACHE_SECONDS:
-        return hit[1]
-    lat, lon = PLACES[place]
-    req = urllib.request.Request(API.format(lat, lon), headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as r:
-        data = json.load(r)["forecasts"]
-    _cache[place] = (time.time(), data)
-    return data
-
-
-def y_for(value, y0, step):
-    """Piecewise scale: 0 -> baseline, 40/70/100 -> gridlines 1/2/3, evenly spaced."""
-    pts = [0, 40, 70, 100]
-    value = max(0, min(100, value))
-    for i in range(3):
-        if value <= pts[i + 1]:
-            frac = (value - pts[i]) / (pts[i + 1] - pts[i])
-            return y0 - (i + frac) * step
-    return y0 - 3 * step
-
-
-def render(place):
-    data = fetch(place)
-    times = [datetime.fromisoformat(d["datetime"]) for d in data]
-    vals = [d["value"] for d in data]
-
-    img = Image.new("RGB", (W * S, H * S), BG)
-    d = ImageDraw.Draw(img)
-    left, right, y0, step = 122 * S, 679 * S, 208 * S, 42 * S
-
-    for i, (_, label) in enumerate(LEVELS, 1):
-        y = y0 - i * step
-        d.line([(left, y), (right, y)], fill=GRID, width=S)
-        d.text((40 * S, y), label, font=font(22), fill="#bdbdbd", anchor="lm")
-
-    n = len(data)
-    slot = (right - left) / n
-    bw = max(2, int(slot * 0.55))
-    for i, v in enumerate(vals):
-        if v > 0:
-            x = left + (i + 0.5) * slot
-            d.rectangle([x - bw / 2, y_for(v, y0, step), x + bw / 2, y0], fill=BAR)
-
-    d.line([(left, y0), (right, y0)], fill=BASE, width=S)
-
-    # x labels every hour, anchored at the first slot's minutes (e.g. 12:20, 13:20 ...)
-    f = font(24)
-    start = next((i for i, t in enumerate(times) if t.minute % 20 == 0 and t.minute == times[0].minute), 0)
-    for i in range(start, n, 12):
-        text = times[i].strftime("%H:%M")
-        x = min(left + i * slot, right - d.textlength(text, font=f))  # keep inside the plot
-        d.text((x, 247 * S), text, font=f, fill=FG, anchor="lm")
-
-    out = img.resize((W, H), Image.LANCZOS)
-    buf = io.BytesIO()
-    out.save(buf, "PNG")
-    return buf.getvalue()
+def get_png(place, theme):
+    key = (place, theme)
+    with _lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < CACHE_SECONDS:
+            return hit[1]
+        png = capture(place, theme)
+        _cache[key] = (time.time(), png)
+        return png
 
 
 INDEX = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width">
@@ -110,7 +99,8 @@ INDEX = """<!doctype html><meta charset=utf-8><meta name=viewport content="width
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        path = self.path.split("?")[0].strip("/")
+        url = urlparse(self.path)
+        path = url.path.strip("/")
         if path == "":
             body = INDEX.format("".join(
                 f'<h2>{p.title()}</h2><img src="/{p}.png" style="max-width:100%">' for p in PLACES)).encode()
@@ -118,10 +108,11 @@ class Handler(BaseHTTPRequestHandler):
         name = path.removesuffix(".png").lower()
         if name not in PLACES:
             return self.send(404, "text/plain", b"Unknown place. Try: " + ", ".join(PLACES).encode())
+        theme = "light" if parse_qs(url.query).get("theme") == ["light"] else "dark"
         try:
-            self.send(200, "image/png", render(name), {"Cache-Control": f"max-age={CACHE_SECONDS}"})
-        except Exception as e:  # upstream failure
-            self.send(502, "text/plain", f"Could not fetch Buienradar data: {e}".encode())
+            self.send(200, "image/png", get_png(name, theme), {"Cache-Control": f"max-age={CACHE_SECONDS}"})
+        except Exception as e:  # upstream / browser failure
+            self.send(502, "text/plain", f"Could not capture the Buienradar graph: {e}".encode())
 
     def send(self, code, ctype, body, extra=None):
         self.send_response(code)
