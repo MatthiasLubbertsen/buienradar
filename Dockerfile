@@ -1,6 +1,4 @@
-# This image ships Python and Chromium; the matching `playwright` package comes from pip.
-# Keep the tag in sync with requirements.txt.
-FROM mcr.microsoft.com/playwright/python:v1.64.0-noble
+FROM python:3.13-slim
 
 WORKDIR /app
 COPY requirements.txt .

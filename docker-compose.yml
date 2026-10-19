@@ -4,5 +4,8 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
-    init: true        # reap leftover Chromium processes
-    ipc: host         # Chromium needs more shared memory than Docker's default
+    volumes:
+      - fonts:/app/fonts   # keeps the downloaded Buienradar font across rebuilds
+
+volumes:
+  fonts:

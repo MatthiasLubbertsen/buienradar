@@ -1,4 +1,5 @@
 .git
 __pycache__/
 *.png
+fonts/
 README.md
