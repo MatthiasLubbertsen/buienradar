@@ -45,6 +45,7 @@ UA = {"User-Agent": "Mozilla/5.0"}
 W, H = 715, 162
 SVG_X, SVG_W, SVG_H = 48, 666.66, 130
 VB_W = 332
+PAD = 16   # CSS px of background around the graph
 SCALE = 2  # output pixels per CSS pixel
 SS = 2     # extra supersampling for smooth edges
 THEMES = {
@@ -197,7 +198,9 @@ def render(place, theme="dark"):
         d.text(((x + 0.5) * k, 150 * k), s, font=f, fill=t["text"], anchor="lm")
         x += w + gap
 
-    out = img.resize((W * SCALE, H * SCALE), Image.LANCZOS)
+    graph = img.resize((W * SCALE, H * SCALE), Image.LANCZOS)
+    out = Image.new("RGB", ((W + 2 * PAD) * SCALE, (H + 2 * PAD) * SCALE), t["bg"])
+    out.paste(graph, (PAD * SCALE, PAD * SCALE))
     buf = io.BytesIO()
     out.save(buf, "PNG")
     return buf.getvalue()
